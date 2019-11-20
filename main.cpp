@@ -26,104 +26,22 @@
 #include <globjects/VertexAttributeBinding.h>
 #include <globjects/Buffer.h>
 
-using namespace gl;
-using namespace glm;
-using namespace globjects;
-
-class MiniMesh : public globjects::Instantiator<MiniMesh>
-{
-public:
-
-    struct Vertex {
-        vec3 pos;
-        vec3 normal;
-    };
-    using Face = std::array<gl::GLuint, 3>;
-
-public:
-    MiniMesh(const std::vector<Vertex> &v, const std::vector<Face> &f);
-
-    virtual ~MiniMesh(){};
-
-    /** draws the mesh as single triangles
-    */
-    void draw();
-    void draw(gl::GLenum mode);
-    std::vector<Vertex> &vertices(){return m_vertices;}
-    std::vector<Vertex> &restVertices(){return m_restVertices;}
-    void updateVertices(){
-            m_gpuVertices->setData(m_vertices, GL_STATIC_DRAW);
-            auto vertexBinding = m_vao->binding(0);
-            vertexBinding->setBuffer(m_gpuVertices.get(), 0, sizeof(Vertex));
-    }
-
-protected:
-    std::vector<Vertex> m_vertices;
-    std::vector<Vertex> m_restVertices;
-    std::vector<Face> m_indices;
-    gl::GLsizei m_size;
-    std::unique_ptr<globjects::VertexArray> m_vao;
-    std::unique_ptr<globjects::Buffer> m_gpuVertices;
-    std::unique_ptr<globjects::Buffer> m_gpuIndices;
-};
-
-MiniMesh::MiniMesh(const std::vector<Vertex> &v, const std::vector<Face> &f):
-    m_vao(VertexArray::create())
-    , m_gpuVertices(Buffer::create())
-    , m_gpuIndices(Buffer::create())
-{
-    m_indices.insert(m_indices.begin(), f.begin(), f.end());
-    m_restVertices.insert(m_vertices.begin(), v.begin(), v.end());
-    m_vertices.insert(m_vertices.begin(), v.begin(), v.end());
-    
-    m_gpuIndices->setData(m_indices, GL_STATIC_DRAW);
-    m_gpuVertices->setData(m_vertices, GL_STATIC_DRAW);
-
-    m_size = static_cast<GLsizei>(m_indices.size() * 3);
-
-    m_vao->bindElementBuffer(m_gpuIndices.get());
-
-    {
-        auto vertexBinding = m_vao->binding(0);
-        vertexBinding->setAttribute(0);
-        vertexBinding->setBuffer(m_gpuVertices.get(), 0, sizeof(Vertex));
-        vertexBinding->setFormat(3, GL_FLOAT, GL_FALSE);
-        m_vao->enable(0);
-    }
-    {
-        auto vertexBinding = m_vao->binding(1);
-        vertexBinding->setAttribute(1);
-        vertexBinding->setBuffer(m_gpuVertices.get(), offsetof(Vertex, normal), sizeof(Vertex));
-        vertexBinding->setFormat(3, GL_FLOAT, GL_TRUE);
-        m_vao->enable(1);
-    }
-
-    m_vao->unbind();
-}
+#include "MiniMesh.hpp"
+#include "Bone.hpp"
 
 
-void MiniMesh::draw()
-{
-    draw(GL_TRIANGLES);
-}
+Bone parent_bone;
+Bone child_bone;
 
-void MiniMesh::draw(const GLenum mode)
-{
-    glEnable(GL_DEPTH_TEST);
-    
-    m_vao->bind();
-    m_vao->drawElements(mode, m_size, GL_UNSIGNED_INT, nullptr);
-    m_vao->unbind();
-}
+bool g_gpu;
 
-
-std::unique_ptr<MiniMesh> makeCylinder(vec3 base=vec3(0,0,0), vec3 axis = vec3(1,0,0), float radius = .5f, float length = 3., int subdiv1 = 64, int subdiv2 = 512){
+std::unique_ptr<MiniMesh> makeCylinder(glm::vec3 base=glm::vec3(0,0,0), glm::vec3 axis = glm::vec3(1,0,0), float radius = .5f, float length = 3., int subdiv1 = 64, int subdiv2 = 512){
 
     std::vector<MiniMesh::Vertex> vertices;
     std::vector<MiniMesh::Face> indices;
-    vec3 x = vec3(0,1,0); //orthogonal(axis);
-    vec3 y = cross(axis, x);
-    
+    glm::vec3 x = glm::vec3(0,1,0); //orthogonal(axis);
+    glm::vec3 y = cross(axis, x);
+
     for(int i=0; i<subdiv2; i++)
     {
         float offset = float(i)/float(subdiv2-1);
@@ -132,8 +50,10 @@ std::unique_ptr<MiniMesh> makeCylinder(vec3 base=vec3(0,0,0), vec3 axis = vec3(1
         {
             float angle = 2.*glm::pi<float>()*float(j)/float(subdiv1);
             MiniMesh::Vertex nv;
-            nv.pos = base+offset2*axis+radius*cos(angle)*x+radius*sin(angle)*y;
-            nv.normal = normalize(cos(angle)*x+sin(angle)*y);
+            nv.pos = base+offset2*axis+radius*glm::cos(angle)*x+radius*glm::sin(angle)*y;
+            nv.normal = glm::normalize(glm::cos(angle)*x+glm::sin(angle)*y);
+            nv.weights[0] = float(i)/subdiv2; // Handler 1
+            nv.weights[1] = 1-nv.weights[0]; // Handler 2
             vertices.push_back(nv);
         }
     }
@@ -150,12 +70,12 @@ std::unique_ptr<MiniMesh> makeCylinder(vec3 base=vec3(0,0,0), vec3 axis = vec3(1
         }
 
     }
-    
+
     return MiniMesh::create(vertices, indices);
 }
 
 
-namespace 
+namespace
 {
     std::unique_ptr<globjects::Program> g_program = nullptr;
     std::unique_ptr<globjects::File> g_vertexShaderSource = nullptr;
@@ -194,19 +114,23 @@ void initialize()
 {
     const auto dataPath = std::string("./Shaders/");
 
+    parent_bone.transform = glm::mat4(1.0);
+    child_bone.transform = glm::mat4(1.0);
+
+
     g_program = globjects::Program::create();
 
-    g_vertexShaderSource = globjects::Shader::sourceFromFile(dataPath + "./basic.vert");
+    g_vertexShaderSource = globjects::Shader::sourceFromFile(dataPath + (g_gpu?"./basic_gpu.vert":"./basic.vert"));
     g_vertexShaderTemplate = globjects::Shader::applyGlobalReplacements(g_vertexShaderSource.get());
-    g_vertexShader = globjects::Shader::create(GL_VERTEX_SHADER, g_vertexShaderTemplate.get());
-    
+    g_vertexShader = globjects::Shader::create(gl::GL_VERTEX_SHADER, g_vertexShaderTemplate.get());
+
     g_fragmentShaderSource = globjects::Shader::sourceFromFile(dataPath + "./basic.frag");
     g_fragmentShaderTemplate = globjects::Shader::applyGlobalReplacements(g_fragmentShaderSource.get());
-    g_fragmentShader = globjects::Shader::create(GL_FRAGMENT_SHADER, g_fragmentShaderTemplate.get());
+    g_fragmentShader = globjects::Shader::create(gl::GL_FRAGMENT_SHADER, g_fragmentShaderTemplate.get());
 
     g_phongShaderSource = globjects::Shader::sourceFromFile(dataPath + "./phong.frag");
     g_phongShaderTemplate = globjects::Shader::applyGlobalReplacements(g_phongShaderSource.get());
-    g_phongShader = globjects::Shader::create(GL_FRAGMENT_SHADER, g_phongShaderTemplate.get());
+    g_phongShader = globjects::Shader::create(gl::GL_FRAGMENT_SHADER, g_phongShaderTemplate.get());
 
     g_program->attach(
         g_vertexShader.get(),
@@ -215,6 +139,8 @@ void initialize()
     );
 
     g_mesh = makeCylinder();
+
+    g_mesh->updateVertices(g_mesh->vertices());
 
     resize();
 }
@@ -239,21 +165,26 @@ void deinitialize()
 
 void draw()
 {
-    glClearColor(0.01,0.1,0.1,1);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    gl::glClearColor(0.01,0.1,0.1,1);
+    gl::glClear(gl::GL_COLOR_BUFFER_BIT | gl::GL_DEPTH_BUFFER_BIT);
 
-    const auto t_elapsed = std::chrono::high_resolution_clock::now() - g_starttime;  
+    const auto t_elapsed = std::chrono::high_resolution_clock::now() - g_starttime;
     const auto t = static_cast<float>(t_elapsed.count()) * 4e-10f;
 
     g_program->setUniform("transform", g_viewProjection);
 
-    const auto level = static_cast<int>((sin(t) * 0.5f + 0.5f) * 16) + 1;
+    if(g_gpu){
+      g_program->setUniform("child_bone", child_bone.transform);
+      g_program->setUniform("parent_bone", parent_bone.transform);
+    }
+
+    const auto level = static_cast<int>((glm::sin(t) * 0.5f + 0.5f) * 16) + 1;
     g_program->setUniform("level", level);
     g_program->use();
 
-    glViewport(0, 0, g_size.x, g_size.y);
+    gl::glViewport(0, 0, g_size.x, g_size.y);
 
-    g_mesh->draw(GL_TRIANGLES);
+    g_mesh->draw(gl::GL_TRIANGLES);
 
     g_program->release();
 }
@@ -270,6 +201,23 @@ void framebuffer_size_callback(GLFWwindow * /*window*/, int width, int height)
     resize();
 }
 
+void reload(float parent, float child) {
+
+  parent_bone.transform = glm::rotate(parent_bone.transform,parent,glm::vec3(0,0,1));
+  child_bone.transform = glm::rotate( child_bone.transform,child,glm::vec3(0,0,1));
+
+  if( ! g_gpu){
+    glm::vec4 tmp;
+    for (unsigned int i = 0; i < g_mesh->restVertices().size(); i++) {
+      tmp = glm::vec4(g_mesh->restVertices()[i].pos,1.0);
+      tmp = parent_bone.transform * g_mesh->restVertices()[i].weights[0] * tmp
+            + parent_bone.transform * child_bone.transform * g_mesh->restVertices()[i].weights[1] * tmp;
+      g_mesh->vertices()[i].pos = glm::vec3(tmp.x,tmp.y,tmp.z)/tmp.w;
+    }
+  }
+
+}
+
 void key_callback(GLFWwindow * window, int key, int /*scancode*/, int action, int /*modes*/)
 {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_RELEASE)
@@ -281,11 +229,29 @@ void key_callback(GLFWwindow * window, int key, int /*scancode*/, int action, in
         g_fragmentShaderSource->reload();
         g_phongShaderSource->reload();
     }
+    float scale = 0.1;
+    if (key == GLFW_KEY_F1) reload(scale,0.0);
+    if (key == GLFW_KEY_F2) reload(-scale,0.0);
+    if (key == GLFW_KEY_F3) reload(0.0,-scale);
+    if (key == GLFW_KEY_F4) reload(0.0,scale);
+
+    g_mesh->updateVertices(g_mesh->vertices());
 }
 
 
-int main(int /*argc*/, char * /*argv*/[])
+
+
+int main(int argc, char * argv[])
 {
+    if( argc!= 2){
+      std::cerr << "Usage: "<< argv[0] << " -gpu | -cpu" << '\n';
+      exit(-1);
+    }
+
+    if(argv[1][1]=='g'){
+      g_gpu = true;
+    }
+
     // Initialize GLFW
     if (!glfwInit())
         return 1;
@@ -316,7 +282,8 @@ int main(int /*argc*/, char * /*argv*/[])
     std::cout << std::endl
         << "OpenGL Version:  " << glbinding::ContextInfo::version() << std::endl
         << "OpenGL Vendor:   " << glbinding::ContextInfo::vendor() << std::endl
-        << "OpenGL Renderer: " << glbinding::ContextInfo::renderer() << std::endl << std::endl;
+        << "OpenGL Renderer: " << glbinding::ContextInfo::renderer() << std::endl
+        << "Annimation GPU : " << (g_gpu?"ON":"OFF") << std::endl;
 
     globjects::info() << "Press F5 to reload shaders." << std::endl << std::endl;
 
